@@ -23,6 +23,12 @@ struct Request
     vector<pair<string, int>> requests;
 };
 
+struct ChaosRequest
+{
+    int bakerIndex;
+    pair<string, int> request;
+};
+
 struct Order
 {
     string customerName;
@@ -181,42 +187,39 @@ void createRequest(Request &request, const int &queueNumber)
 
 void *customer(void *req)
 {
-    auto *request = (Request *)(req);
+    auto *request = (ChaosRequest *)(req);
     int bakerIndex = request->bakerIndex;
-    string customerQueueName = "Customer_" + to_string(bakerIndex) + ' ';
-    printf("%s thread started.\n", customerQueueName.c_str());
+    string customerQueueName = "Customer_" + request->request.first + to_string(bakerIndex) + ' ';
+    printf("%s THREAD started.\n", customerQueueName.c_str());
 
     queue<Order> *requestQueue = &requestQueues[bakerIndex];
     queue<Order> *deliveryQueue = &deliveryQueues[bakerIndex];
     pthread_mutex_t *requestOrderLock = &requestOrderLocks[bakerIndex];
     pthread_cond_t *requestOrderLockCondition = &requestOrderLockConditions[bakerIndex];
 
-    for (size_t i = 0; i < request->requests.size(); i++)
+    Order order;
+    order.breadCount = request->request.second;
+    order.customerName = request->request.first;
+
+    // ------ Sending order --------
+    pthread_mutex_lock(requestOrderLock);
+    requestQueue->push(order);
+    printf("Customer %s is ordering %d breads to baker #%d \n", order.customerName.c_str(), order.breadCount, bakerIndex);
+    pthread_cond_signal(requestOrderLockCondition);
+    pthread_mutex_unlock(requestOrderLock);
+    // ------ End Sending order --------
+
+    // ------ Receiving Bread --------
+    pthread_mutex_lock(&sharedSpaceLock);
+    while (deliveryQueue->empty())
     {
-        Order order;
-        order.breadCount = request->requests[i].second;
-        order.customerName = request->requests[i].first;
-
-        // ------ Sending order --------
-        pthread_mutex_lock(requestOrderLock);
-        requestQueue->push(order);
-        printf("Customer %s is ordering %d breads to baker #%d \n", order.customerName.c_str(), order.breadCount, bakerIndex);
-        pthread_cond_signal(requestOrderLockCondition);
-        pthread_mutex_unlock(requestOrderLock);
-        // ------ End Sending order --------
-
-        // ------ Receiving Bread --------
-        pthread_mutex_lock(&sharedSpaceLock);
-        while (deliveryQueue->empty())
-        {
-            pthread_cond_wait(&sharedSpaceLockCondition[bakerIndex], &sharedSpaceLock);
-        }
-        auto response = deliveryQueue->front();
-        deliveryQueue->pop();
-        cout << "Customer: " << response.customerName << " Received " << response.breadCount << " breads and is leaving...\n\n";
-        pthread_mutex_unlock(&sharedSpaceLock);
-        // ------ End Receiving Bread --------
+        pthread_cond_wait(&sharedSpaceLockCondition[bakerIndex], &sharedSpaceLock);
     }
+    auto response = deliveryQueue->front();
+    deliveryQueue->pop();
+    cout << "Customer: " << response.customerName << " Received " << response.breadCount << " breads and is leaving...\n\n";
+    pthread_mutex_unlock(&sharedSpaceLock);
+    // ------ End Receiving Bread --------
 
     customerFinished[bakerIndex] = true;
     printf("%s thread ended.\n", customerQueueName.c_str());
@@ -325,12 +328,12 @@ void *oven(void *arg)
 int main(int argc, char *argv[])
 {
     //////////////// input and init threads, clock, locks ////////////////
-    pthread_t timer_handler, customer_handler[BAKER_COUNT], baker_handler[BAKER_COUNT], oven_handler;
     sem_init(&ovenEmptySlots, 0, OVEN_MAX_CAPACITY);
     sem_init(&ovenFullSlots, 0, 0);
     clockInit();
 
     vector<Request> reqs(BAKER_COUNT);
+    int customerCount = 0;
     for (int i = 0; i < BAKER_COUNT; i++)
     {
         bakerFinished[i] = false;
@@ -341,9 +344,12 @@ int main(int argc, char *argv[])
 
         Request request;
         createRequest(request, i);
+        customerCount += request.requests.size();
         request.bakerIndex = i;
         reqs[i] = request;
     }
+    pthread_t timer_handler, customer_handler[customerCount], baker_handler[BAKER_COUNT], oven_handler;
+
     /////////////////////////////////////////////////////////////////////////
 
     cout << "\n\n**** Starting program **** \n\n";
@@ -351,20 +357,32 @@ int main(int argc, char *argv[])
 
     //////////////// create threads ////////////////
     pthread_create(&timer_handler, nullptr, &timer_thread, nullptr);
+    int count = 0;
     for (int i = 0; i < BAKER_COUNT; i++)
     {
         int *bakerIndex = (int *)malloc(sizeof(int));
         *bakerIndex = i;
         pthread_create(&baker_handler[i], nullptr, &baker, bakerIndex);
-        pthread_create(&customer_handler[i], nullptr, &customer, &reqs[i]);
+
+        for (int j = 0; j < reqs[i].requests.size(); j++)
+        {
+            auto* newReq = (ChaosRequest*) malloc(sizeof(ChaosRequest));
+            newReq->bakerIndex = i;
+            newReq->request = reqs[i].requests[j];
+            pthread_create(&customer_handler[count++], nullptr, &customer, newReq);
+        }
     }
     pthread_create(&oven_handler, nullptr, oven, nullptr);
     ////////////////////////////////////////////////
 
     //////////////// join threads ////////////////
-    for (int i = 0; i < BAKER_COUNT; i++)
+    for (int i = 0; i < customerCount; i++)
     {
         pthread_join(customer_handler[i], nullptr);
+    }
+
+    for (int i = 0; i < BAKER_COUNT; i++)
+    {
         pthread_join(baker_handler[i], nullptr);
     }
     pthread_join(oven_handler, nullptr);
